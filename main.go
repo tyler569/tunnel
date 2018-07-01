@@ -11,7 +11,7 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
-	"time"
+	// "time"
 
 	"github.com/songgao/water"
 )
@@ -52,6 +52,68 @@ const (
 	TYPE_KEYX
 )
 
+func doSendData(iface *water.Interface, conn net.Conn, encrypt cipher.Stream) {
+	buf := make([]byte, 10*1024)
+
+	if_r := bufio.NewReader(iface)
+	conn_w := bufio.NewWriter(conn)
+
+	for {
+		n, err := if_r.Read(buf)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// log.Println("Read", n, "bytes from tun interface")
+
+		if buf[0]&0xF0 != 0x40 {
+			// log.Println("Ignoring non-ipv4 packet")
+			continue
+		}
+
+		pkt := make([]byte, n+1)
+		pkt[0] = TYPE_DATA
+		copy(pkt[1:], buf[:n])
+		encrypt.XORKeyStream(pkt, pkt)
+
+		conn_w.Write(pkt)
+		conn_w.Flush()
+	}
+}
+
+func doRecieveData(iface *water.Interface, conn net.Conn, decrypt cipher.Stream) {
+	buf := make([]byte, 10*1024)
+
+	conn_r := bufio.NewReader(conn)
+	if_w := bufio.NewWriter(iface)
+
+	for {
+		n, err := conn_r.Read(buf)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		pkt := buf[:n]
+		decrypt.XORKeyStream(pkt, pkt)
+
+		switch pkt[0] {
+		case TYPE_DATA:
+			if_w.Write(pkt[1:])
+			if_w.Flush()
+		case TYPE_CTRL:
+			log.Println(string(buf[1:n]))
+		case TYPE_PING:
+			// do nothing
+		default:
+			log.Println("Unknown packet type:", pkt[0])
+		}
+	}
+}
+
+/* func doRoatateKeys(conn net.Conn) {
+	// do magic
+} */
+
 func runTunnelEncap(key []byte, encrypt bool, iface *water.Interface, conn net.Conn) {
 	var stop_exit chan int
 
@@ -62,84 +124,12 @@ func runTunnelEncap(key []byte, encrypt bool, iface *water.Interface, conn net.C
 
 	var iv [aes.BlockSize]byte
 
-	enc_s := cipher.NewCFBEncrypter(block, iv[:])
-	dec_s := cipher.NewCFBDecrypter(block, iv[:])
+	enc_stream := cipher.NewCFBEncrypter(block, iv[:])
+	dec_stream := cipher.NewCFBDecrypter(block, iv[:])
 
-	go func() {
-		buf := make([]byte, 10*1024)
-
-		if_r := bufio.NewReader(iface)
-		conn_w := bufio.NewWriter(conn)
-
-		for {
-			n, err := if_r.Read(buf)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			// log.Println("Read", n, "bytes from tun interface")
-
-			if buf[0]&0xF0 != 0x40 {
-				// log.Println("Ignoring non-ipv4 packet")
-				continue
-			}
-
-			pkt := make([]byte, n+1)
-			pkt[0] = TYPE_DATA
-			copy(pkt[1:], buf[:n])
-			if encrypt {
-				enc_s.XORKeyStream(pkt, pkt)
-			}
-
-			conn_w.Write(pkt)
-			conn_w.Flush()
-		}
-	}()
-
-	go func() {
-		conn_w := bufio.NewWriter(conn)
-		for {
-			<-time.After(5 * time.Second)
-			pkt := []byte("\x03keepalive ping")
-
-			if encrypt {
-				enc_s.XORKeyStream(pkt, pkt)
-			}
-			conn_w.Write(pkt)
-			conn_w.Flush()
-		}
-	}()
-
-	go func() {
-		buf := make([]byte, 10*1024)
-
-		conn_r := bufio.NewReader(conn)
-		if_w := bufio.NewWriter(iface)
-
-		for {
-			n, err := conn_r.Read(buf)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			pkt := buf[:n]
-			if encrypt {
-				dec_s.XORKeyStream(pkt, pkt)
-			}
-
-			switch pkt[0] {
-			case TYPE_DATA:
-				if_w.Write(pkt[1:])
-				if_w.Flush()
-			case TYPE_CTRL:
-				log.Println(string(buf[1:n]))
-			case TYPE_PING:
-				// do nothing
-			default:
-				log.Println("Unknown packet type:", pkt[0])
-			}
-		}
-	}()
+	go doSendData(iface, conn, enc_stream)
+	go doRecieveData(iface, conn, dec_stream)
+	// go doRotateKeys(conn)
 
 	<-stop_exit
 }
