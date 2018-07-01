@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/hex"
+	// "crypto/rand"
 	"flag"
 	// "io"
 	"log"
@@ -14,6 +14,7 @@ import (
 	// "time"
 
 	"github.com/songgao/water"
+	"golang.org/x/crypto/scrypt"
 )
 
 func initTun(name string, address string) *water.Interface {
@@ -134,12 +135,33 @@ func runTunnelEncap(key []byte, encrypt bool, iface *water.Interface, conn net.C
 	<-stop_exit
 }
 
+const (
+	INIT_WITH_IP = iota + 1
+	ROTATE_IN_KEY
+	ROTATE_OUT_KEY
+)
+
+type Control struct {
+	word    int
+	new_ip  net.IP
+	new_key []byte
+}
+
+type Connection struct {
+	remote  net.IP
+	encrypt chan []byte
+	decrypt chan []byte
+	control chan []Control
+}
+
 func main() {
 	var (
 		server = flag.Bool("server", false, "Acting as server")
 		addr   = flag.String("addr", "6.0.0.2/8", "Address of the tunnel adapter")
 		remote = flag.String("remote", "", "Address of server to connect to")
 		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
+		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
+		rotate = flag.Bool("rotate", false, "Use rotatable keys for tunnel")
 	)
 
 	flag.Parse()
@@ -153,17 +175,23 @@ func main() {
 	var (
 		iface = initTun("tunnel", *addr)
 		conn  net.Conn
-		err   error
 	)
 
 	if *server && *remote != "" {
 		log.Fatal("If running as a server, remote must not be specified")
 	}
 
-	remote_s := (*remote + ":" + strconv.Itoa(*port))
+	if *rotate {
+		log.Fatal("Key rotation not yet implemented")
+	}
 
-	hexkey := "fa76b62c6ca79481ea747aefd80f98ddc896e8d9d68ff7aebbe4d54d448e85ec"
-	key, err := hex.DecodeString(hexkey)
+	remote_s := *remote + ":" + strconv.Itoa(*port)
+
+	salt := []byte("This is a salt for the tunnel scrypt initial key")
+
+	// This key will be replaced by a random one as soon as I implement
+	// key rotation
+	key, err := scrypt.Key([]byte(*psk), salt, 32768, 8, 1, 32)
 	if err != nil {
 		log.Fatal(err)
 	}
