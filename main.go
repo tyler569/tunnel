@@ -14,9 +14,6 @@ import (
 	"strconv"
 	// "time"
 
-	"net/http"
-	_ "net/http/pprof"
-
 	"github.com/songgao/water"
 	"golang.org/x/crypto/scrypt"
 )
@@ -119,11 +116,6 @@ func Connect(wr io.Writer, rd io.Reader) {
 }
 
 func main() {
-	// pprof
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-
 	var (
 		server = flag.Bool("server", false, "Acting as server")
 		addr   = flag.String("addr", "6.0.0.2/8", "Address of the tunnel adapter")
