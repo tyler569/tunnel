@@ -5,8 +5,6 @@ A simple VPN built using a Linux TUN adapter
 
 ### Usage
 
-I would highly reccomend changing the hardcoded key in the code (`hexkey`) if you plan on using this for anything.
-
 Deploy the same binary to the client and server, then run these commands:
 
 Server: `./tunnel --server --addr <server cidr>`
@@ -31,10 +29,3 @@ In that example, any traffic sent to 10.200.0.10 on the server will go to the cl
 
 `--port` : sets the port for the server to listen on or the client to connect to.
 
-### Future plans
-
-- Key generation and automatic rotation
-- IKE / ISAKMP
-- More ciphers
-- More flexability
-- Support for more than one simultanious client on the server
