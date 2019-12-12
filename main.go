@@ -1,17 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
-	// "crypto/rand"
+	"crypto/rand"
+	"errors"
 	"flag"
-	// "io"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os/exec"
 	"strconv"
 	// "time"
+
+	"net/http"
+	_ "net/http/pprof"
 
 	"github.com/songgao/water"
 	"golang.org/x/crypto/scrypt"
@@ -46,122 +50,86 @@ func initTun(name string, address string) *water.Interface {
 	return iface
 }
 
-const (
-	TYPE_DATA = iota + 1
-	TYPE_CTRL
-	TYPE_PING
-	TYPE_KEYX
-)
-
-func doSendData(iface *water.Interface, conn net.Conn, encrypt cipher.Stream) {
-	buf := make([]byte, 10*1024)
-
-	if_r := bufio.NewReader(iface)
-	conn_w := bufio.NewWriter(conn)
-
-	for {
-		n, err := if_r.Read(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// log.Println("Read", n, "bytes from tun interface")
-
-		if buf[0]&0xF0 != 0x40 {
-			// log.Println("Ignoring non-ipv4 packet")
-			continue
-		}
-
-		pkt := make([]byte, n+1)
-		pkt[0] = TYPE_DATA
-		copy(pkt[1:], buf[:n])
-		encrypt.XORKeyStream(pkt, pkt)
-
-		conn_w.Write(pkt)
-		conn_w.Flush()
-	}
+type TunnelConnection struct {
+	link  net.Conn
+	key   []byte
+	block cipher.Block
 }
 
-func doRecieveData(iface *water.Interface, conn net.Conn, decrypt cipher.Stream) {
-	buf := make([]byte, 10*1024)
+const MTU = 2048
 
-	conn_r := bufio.NewReader(conn)
-	if_w := bufio.NewWriter(iface)
+func (t TunnelConnection) Read(data []byte) (int, error) {
+	packet := make([]byte, MTU)
+	iv := packet[:aes.BlockSize]
 
-	for {
-		n, err := conn_r.Read(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		pkt := buf[:n]
-		decrypt.XORKeyStream(pkt, pkt)
-
-		switch pkt[0] {
-		case TYPE_DATA:
-			if_w.Write(pkt[1:])
-			if_w.Flush()
-		case TYPE_CTRL:
-			log.Println(string(buf[1:n]))
-		case TYPE_PING:
-			// do nothing
-		default:
-			log.Println("Unknown packet type:", pkt[0])
-		}
-	}
-}
-
-/* func doRoatateKeys(conn net.Conn) {
-	// do magic
-} */
-
-func runTunnelEncap(key []byte, encrypt bool, iface *water.Interface, conn net.Conn) {
-	var stop_exit chan int
-
-	block, err := aes.NewCipher(key)
+	n, err := t.link.Read(packet)
 	if err != nil {
-		log.Fatal(err)
+		return 0, err
+	}
+	if n < aes.BlockSize+1 {
+		return 0, errors.New("Packet too short")
 	}
 
-	var iv [aes.BlockSize]byte
+	stream := cipher.NewCTR(t.block, iv)
+	decrypted_data := make([]byte, n-aes.BlockSize)
+	stream.XORKeyStream(decrypted_data, packet[aes.BlockSize:n])
 
-	enc_stream := cipher.NewCFBEncrypter(block, iv[:])
-	dec_stream := cipher.NewCFBDecrypter(block, iv[:])
-
-	go doSendData(iface, conn, enc_stream)
-	go doRecieveData(iface, conn, dec_stream)
-	// go doRotateKeys(conn)
-
-	<-stop_exit
+	copy(data, decrypted_data)
+	return min(len(data), len(decrypted_data)), nil
 }
 
-const (
-	INIT_WITH_IP = iota + 1
-	ROTATE_IN_KEY
-	ROTATE_OUT_KEY
-)
+func (t TunnelConnection) Write(data []byte) (int, error) {
+	encrypted_data := make([]byte, len(data)+aes.BlockSize)
+	iv := encrypted_data[:aes.BlockSize]
 
-type Control struct {
-	word    int
-	new_ip  net.IP
-	new_key []byte
+	count, err := rand.Reader.Read(iv)
+	if count != aes.BlockSize || err != nil {
+		return 0, err
+	}
+
+	stream := cipher.NewCTR(t.block, iv)
+	stream.XORKeyStream(encrypted_data[aes.BlockSize:], data)
+
+	_, err = t.link.Write(encrypted_data)
+	return len(data), err
 }
 
-type Connection struct {
-	remote  net.IP
-	encrypt chan []byte
-	decrypt chan []byte
-	control chan []Control
+func (t TunnelConnection) Close() error {
+	t.link.Close()
+
+	// flag this structure as closed?
+	return nil
+}
+
+func Connect(wr io.Writer, rd io.Reader) {
+	buffer := make([]byte, MTU)
+	for {
+		n, err := rd.Read(buffer)
+		if err != nil {
+			fmt.Println(err)
+			break
+		}
+		_, err = wr.Write(buffer[:n])
+		if err != nil {
+			fmt.Println(err)
+			break
+		}
+		// fmt.Print(".")
+	}
 }
 
 func main() {
+	// pprof
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	var (
 		server = flag.Bool("server", false, "Acting as server")
 		addr   = flag.String("addr", "6.0.0.2/8", "Address of the tunnel adapter")
 		remote = flag.String("remote", "", "Address of server to connect to")
 		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
 		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
-		rotate = flag.Bool("rotate", false, "Use rotatable keys for tunnel")
 	)
 
 	flag.Parse()
@@ -177,43 +145,58 @@ func main() {
 		conn  net.Conn
 	)
 
-	if *server && *remote != "" {
-		log.Fatal("If running as a server, remote must not be specified")
-	}
-
-	if *rotate {
-		log.Fatal("Key rotation not yet implemented")
-	}
-
 	remote_s := *remote + ":" + strconv.Itoa(*port)
 
-	salt := []byte("This is a salt for the tunnel scrypt initial key")
+	udp, err := net.ResolveUDPAddr("udp", remote_s)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// This key will be replaced by a random one as soon as I implement
-	// key rotation
+	salt := []byte("This is a salt for the tunnel scrypt initial key")
 	key, err := scrypt.Key([]byte(*psk), salt, 32768, 8, 1, 32)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if *server {
-		log.Println("Waiting for connection on port tcp", remote_s)
-		ln, err := net.Listen("tcp", remote_s)
+		conn, err := net.ListenPacket("udp", remote_s)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
-		conn, err = ln.Accept()
-		if err != nil {
-			log.Fatal(err)
+
+		udp_conn := conn.(*net.UDPConn)
+
+		demux := NewUDPDemux(udp_conn)
+		go demux.PerformDemux()
+
+		for {
+			c, err := demux.Accept()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("Got connection from", c.RemoteAddr())
+
+			tunnelConnection := TunnelConnection{c, key, block}
+
+			go Connect(iface, tunnelConnection)
+			go Connect(tunnelConnection, iface)
 		}
 	} else {
 		log.Println("Connecting to", remote_s)
-		conn, err = net.Dial("tcp", remote_s)
+		conn, err = net.DialUDP("udp", nil, udp)
 		if err != nil {
 			log.Fatal(err)
 		}
-	}
+		tunnelConnection := TunnelConnection{conn, key, block}
 
-	log.Println("Tunnel running!")
-	runTunnelEncap(key, true, iface, conn)
+		go Connect(tunnelConnection, iface)
+		go Connect(iface, tunnelConnection)
+		c := make(chan int)
+		<-c
+	}
 }
