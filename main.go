@@ -53,7 +53,7 @@ type TunnelConnection struct {
 	block cipher.Block
 }
 
-const MTU = 2048
+const MTU = 2000
 
 func (t TunnelConnection) Read(data []byte) (int, error) {
 	packet := make([]byte, MTU)
@@ -96,23 +96,6 @@ func (t TunnelConnection) Close() error {
 
 	// flag this structure as closed?
 	return nil
-}
-
-func Connect(wr io.Writer, rd io.Reader) {
-	buffer := make([]byte, MTU)
-	for {
-		n, err := rd.Read(buffer)
-		if err != nil {
-			fmt.Println(err)
-			break
-		}
-		_, err = wr.Write(buffer[:n])
-		if err != nil {
-			fmt.Println(err)
-			break
-		}
-		// fmt.Print(".")
-	}
 }
 
 func main() {
@@ -175,8 +158,8 @@ func main() {
 
 			tunnelConnection := TunnelConnection{c, key, block}
 
-			go Connect(iface, tunnelConnection)
-			go Connect(tunnelConnection, iface)
+			go io.Copy(iface, tunnelConnection)
+			go io.Copy(tunnelConnection, iface)
 		}
 	} else {
 		log.Println("Connecting to", remote_s)
@@ -186,8 +169,8 @@ func main() {
 		}
 		tunnelConnection := TunnelConnection{conn, key, block}
 
-		go Connect(tunnelConnection, iface)
-		go Connect(iface, tunnelConnection)
+		go io.Copy(iface, tunnelConnection)
+		go io.Copy(tunnelConnection, iface)
 		c := make(chan int)
 		<-c
 	}
