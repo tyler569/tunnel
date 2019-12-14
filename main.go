@@ -1,10 +1,6 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,7 +11,6 @@ import (
 	// "time"
 
 	"github.com/songgao/water"
-	"golang.org/x/crypto/scrypt"
 )
 
 func initTun(name string, address string) *water.Interface {
@@ -47,47 +42,54 @@ func initTun(name string, address string) *water.Interface {
 	return iface
 }
 
+func rot13(destination, source []byte) {
+	if len(destination) < len(source) {
+		panic("rot13 with smaller destination is impossible")
+	}
+
+	rot := func(r byte) byte {
+		if r >= byte('a') && r <= byte('m') || 
+		   r >= byte('A') && r <= byte('M') {
+			return r + 13
+		} else if r >= byte('n') && r <= byte('z') || 
+		   r >= byte('n') && r <= byte('Z') {
+			return r - 13
+		}
+		return r
+	}
+
+	for i, b := range source {
+		destination[i] = rot(b)
+	}
+}
+
 type TunnelConnection struct {
 	link  net.Conn
-	key   []byte
-	block cipher.Block
 }
 
 const MTU = 2000
 
 func (t TunnelConnection) Read(data []byte) (int, error) {
 	packet := make([]byte, MTU)
-	iv := packet[:aes.BlockSize]
 
 	n, err := t.link.Read(packet)
 	if err != nil {
 		return 0, err
 	}
-	if n < aes.BlockSize+1 {
-		return 0, errors.New("Packet too short")
-	}
 
-	stream := cipher.NewCTR(t.block, iv)
-	decrypted_data := make([]byte, n-aes.BlockSize)
-	stream.XORKeyStream(decrypted_data, packet[aes.BlockSize:n])
+	decrypted_data := make([]byte, n)
+	rot13(decrypted_data, packet[:n])
 
 	copy(data, decrypted_data)
 	return min(len(data), len(decrypted_data)), nil
 }
 
 func (t TunnelConnection) Write(data []byte) (int, error) {
-	encrypted_data := make([]byte, len(data)+aes.BlockSize)
-	iv := encrypted_data[:aes.BlockSize]
+	encrypted_data := make([]byte, len(data))
 
-	count, err := rand.Reader.Read(iv)
-	if count != aes.BlockSize || err != nil {
-		return 0, err
-	}
+	rot13(encrypted_data, data)
 
-	stream := cipher.NewCTR(t.block, iv)
-	stream.XORKeyStream(encrypted_data[aes.BlockSize:], data)
-
-	_, err = t.link.Write(encrypted_data)
+	_, err := t.link.Write(encrypted_data)
 	return len(data), err
 }
 
@@ -104,7 +106,6 @@ func main() {
 		addr   = flag.String("addr", "6.0.0.2/8", "Address of the tunnel adapter")
 		remote = flag.String("remote", "", "Address of server to connect to")
 		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
-		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
 	)
 
 	flag.Parse()
@@ -127,17 +128,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	salt := []byte("This is a salt for the tunnel scrypt initial key")
-	key, err := scrypt.Key([]byte(*psk), salt, 32768, 8, 1, 32)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	if *server {
 		conn, err := net.ListenPacket("udp", remote_s)
 		if err != nil {
@@ -156,7 +146,7 @@ func main() {
 			}
 			fmt.Println("Got connection from", c.RemoteAddr())
 
-			tunnelConnection := TunnelConnection{c, key, block}
+			tunnelConnection := TunnelConnection{c}
 
 			go io.Copy(iface, tunnelConnection)
 			go io.Copy(tunnelConnection, iface)
@@ -167,11 +157,9 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		tunnelConnection := TunnelConnection{conn, key, block}
+		tunnelConnection := TunnelConnection{conn}
 
 		go io.Copy(iface, tunnelConnection)
-		go io.Copy(tunnelConnection, iface)
-		c := make(chan int)
-		<-c
+		io.Copy(tunnelConnection, iface)
 	}
 }
