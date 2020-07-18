@@ -4,23 +4,37 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"os/exec"
 	"strconv"
-	// "time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/songgao/water"
 	"golang.org/x/crypto/scrypt"
 )
 
-func initTun(name string, address string) *water.Interface {
-	// ip, net := net.ParseCIDR(address)
+var block cipher.Block
+var udpSocket *net.UDPConn
+var iface *water.Interface
+var remotes []tunnelConnection
 
+var anyNet net.IPNet = net.IPNet{
+	net.IPv4(0, 0, 0, 0),
+	net.IPv4Mask(0, 0, 0, 0),
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func createTunAdapter(name string, address string) *water.Interface {
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
@@ -28,80 +42,158 @@ func initTun(name string, address string) *water.Interface {
 
 	iface, err := water.New(config)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to create interface:", err)
 	}
 
-	set_up := exec.Command("ip", "link", "set", name, "up")
-	set_addr := exec.Command("ip", "addr", "add", address, "dev", name)
-
-	err = set_up.Run()
-	if err != nil {
-		log.Fatal(err)
+	setIfaceUp := exec.Command("ip", "link", "set", name, "up")
+	if err = setIfaceUp.Run(); err != nil {
+		log.Fatal("Failed to set tun adapter up:", err)
 	}
 
-	err = set_addr.Run()
-	if err != nil {
-		log.Fatal(err)
+	setIfaceAddr := exec.Command("ip", "addr", "add", address, "dev", name)
+	if err = setIfaceAddr.Run(); err != nil {
+		log.Fatal("Failed to set tun adapter interface:", err)
 	}
 
 	return iface
 }
 
-type TunnelConnection struct {
-	link  net.Conn
-	key   []byte
-	block cipher.Block
+func randomIV() (iv []byte) {
+	iv = make([]byte, 16)
+	length, err := rand.Read(iv)
+	if err != nil || length != 16 {
+		log.Fatal("random IV generation failed", err)
+	}
+	return
 }
 
-const MTU = 2000
-
-func (t TunnelConnection) Read(data []byte) (int, error) {
-	packet := make([]byte, MTU)
-	iv := packet[:aes.BlockSize]
-
-	n, err := t.link.Read(packet)
-	if err != nil {
-		return 0, err
+func srcIP(packetData []byte) net.IP {
+	if packetData[0] >> 4 != 4 {
+		return nil
 	}
-	if n < aes.BlockSize+1 {
-		return 0, errors.New("Packet too short")
+	packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Lazy)
+	ip4Layer, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if ip4Layer == nil || !ok {
+		return nil
 	}
-
-	stream := cipher.NewCTR(t.block, iv)
-	decrypted_data := make([]byte, n-aes.BlockSize)
-	stream.XORKeyStream(decrypted_data, packet[aes.BlockSize:n])
-
-	copy(data, decrypted_data)
-	return min(len(data), len(decrypted_data)), nil
+	return ip4Layer.SrcIP
 }
 
-func (t TunnelConnection) Write(data []byte) (int, error) {
-	encrypted_data := make([]byte, len(data)+aes.BlockSize)
-	iv := encrypted_data[:aes.BlockSize]
-
-	count, err := rand.Reader.Read(iv)
-	if count != aes.BlockSize || err != nil {
-		return 0, err
+func dstIP(packetData []byte) net.IP {
+	if packetData[0] >> 4 != 4 {
+		return nil
 	}
-
-	stream := cipher.NewCTR(t.block, iv)
-	stream.XORKeyStream(encrypted_data[aes.BlockSize:], data)
-
-	_, err = t.link.Write(encrypted_data)
-	return len(data), err
+	packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Lazy)
+	ip4Layer, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if ip4Layer == nil || !ok {
+		return nil
+	}
+	return ip4Layer.DstIP
 }
 
-func (t TunnelConnection) Close() error {
-	t.link.Close()
+func (t *tunnelConnection) writePacket(data []byte, server bool) error {
+	encryptedPacket := make([]byte, len(data)+16)
+	iv := randomIV()
+	copy(encryptedPacket, iv)
 
-	// flag this structure as closed?
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(encryptedPacket[16:], data)
+
+	if server {
+		_, err := udpSocket.WriteToUDP(encryptedPacket, &t.remote)
+		return err
+	} else {
+		_, err := udpSocket.Write(encryptedPacket)
+		return err
+	}
+}
+
+func decodePacket(encryptedPacket []byte) []byte {
+	iv := make([]byte, 16)
+	data := make([]byte, len(encryptedPacket)-16)
+	copy(iv, encryptedPacket[:16])
+
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(data, encryptedPacket[16:])
+
+	return data
+}
+
+func findRemote(ip net.IP) *tunnelConnection {
+	for i := range remotes {
+		if remotes[i].tunnelNet.Contains(ip) {
+			return &remotes[i]
+		}
+	}
 	return nil
+}
+
+func findRemoteByUDP(addr net.UDPAddr) *tunnelConnection {
+	for i := range remotes {
+		if remotes[i].remote.String() == addr.String() {
+			return &remotes[i]
+		}
+	}
+	return nil
+}
+
+func fromInterfaceLoop(server bool) {
+	buffer := make([]byte, 2048)
+	for {
+		length, err := iface.Read(buffer)
+		if err != nil {
+			log.Fatal("Failed to read from interface:", err)
+		}
+		packet := buffer[:length]
+
+		dst := dstIP(packet)
+		remote := findRemote(dst)
+		if remote == nil {
+			log.Println("No remote found for tunnel address:", dst)
+			log.Println("remotes:", remotes)
+			continue
+		}
+
+		err = remote.writePacket(packet, server)
+		if err != nil {
+			log.Println("Failed to send packet to:", remote.remote, err)
+			continue
+		}
+	}
+}
+
+func fromUDPLoop() {
+	buffer := make([]byte, 2048)
+	for {
+		length, addr, err := udpSocket.ReadFromUDP(buffer)
+		if err != nil {
+			log.Fatal("Failed to read from UDP:", err)
+		}
+		encryptedPacket := buffer[:length]
+		packet := decodePacket(encryptedPacket)
+		// TODO: decode packet and forward to another client if needed
+		// TODO: drop packet if no known route to destination
+		remote := findRemoteByUDP(*addr)
+		if remote == nil {
+			src := srcIP(packet)
+			if src == nil {
+				// v6 probably
+				continue
+			}
+			log.Println("new remote, ip:", src)
+			remotes = append(remotes, newConnection(*addr, src))
+		}
+		length, err = iface.Write(packet)
+		if err != nil {
+			log.Fatal("Failed to write to interface:", err)
+		}
+	}
 }
 
 func main() {
 	var (
 		server = flag.Bool("server", false, "Acting as server")
-		addr   = flag.String("addr", "6.0.0.2/8", "Address of the tunnel adapter")
+		addr   = flag.String("addr", "10.254.1.2/24", "Address of the tunnel adapter")
 		remote = flag.String("remote", "", "Address of server to connect to")
 		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
 		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
@@ -115,63 +207,41 @@ func main() {
 		log.Println("Starting tunnel as client with addr", *addr)
 	}
 
-	var (
-		iface = initTun("tunnel", *addr)
-		conn  net.Conn
-	)
-
 	remote_s := *remote + ":" + strconv.Itoa(*port)
 
 	udp, err := net.ResolveUDPAddr("udp", remote_s)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to resolve address:", err)
 	}
+
+	iface = createTunAdapter("tunnel", *addr)
 
 	salt := []byte("This is a salt for the tunnel scrypt initial key")
 	key, err := scrypt.Key([]byte(*psk), salt, 32768, 8, 1, 32)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to scrypt key:", err)
 	}
 
-	block, err := aes.NewCipher(key)
+	block, err = aes.NewCipher(key)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to create AES cipher:", err)
 	}
 
 	if *server {
-		conn, err := net.ListenPacket("udp", remote_s)
+		udpSocket, err = net.ListenUDP("udp", udp)
 		if err != nil {
-			panic(err)
+			log.Fatal("Failed to bind to UDP port:", err)
 		}
-
-		udp_conn := conn.(*net.UDPConn)
-
-		demux := NewUDPDemux(udp_conn)
-		go demux.PerformDemux()
-
-		for {
-			c, err := demux.Accept()
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("Got connection from", c.RemoteAddr())
-
-			tunnelConnection := TunnelConnection{c, key, block}
-
-			go io.Copy(iface, tunnelConnection)
-			go io.Copy(tunnelConnection, iface)
-		}
+		go fromInterfaceLoop(*server)
+		fromUDPLoop()
 	} else {
 		log.Println("Connecting to", remote_s)
-		conn, err = net.DialUDP("udp", nil, udp)
+		udpSocket, err = net.DialUDP("udp", nil, udp)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Failed to dial UDP outbound:", err)
 		}
-		tunnelConnection := TunnelConnection{conn, key, block}
-
-		go io.Copy(iface, tunnelConnection)
-		go io.Copy(tunnelConnection, iface)
-		c := make(chan int)
-		<-c
+		remotes = append(remotes, tunnelConnection{*udp, anyNet})
+		go fromInterfaceLoop(*server)
+		fromUDPLoop()
 	}
 }
