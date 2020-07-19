@@ -26,14 +26,6 @@ var anyNet net.IPNet = net.IPNet{
 	net.IPv4Mask(0, 0, 0, 0),
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	} else {
-		return b
-	}
-}
-
 func createTunAdapter(name string, address string) *water.Interface {
 	config := water.Config{
 		DeviceType: water.TUN,
@@ -232,16 +224,14 @@ func main() {
 		if err != nil {
 			log.Fatal("Failed to bind to UDP port:", err)
 		}
-		go fromInterfaceLoop(*server)
-		fromUDPLoop()
 	} else {
-		log.Println("Connecting to", remote_s)
 		udpSocket, err = net.DialUDP("udp", nil, udp)
 		if err != nil {
 			log.Fatal("Failed to dial UDP outbound:", err)
 		}
 		remotes = append(remotes, tunnelConnection{*udp, anyNet})
-		go fromInterfaceLoop(*server)
-		fromUDPLoop()
 	}
+
+	go fromInterfaceLoop(*server)
+	fromUDPLoop()
 }
