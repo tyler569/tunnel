@@ -60,7 +60,7 @@ func randomIV() (iv []byte) {
 }
 
 func srcIP(packetData []byte) net.IP {
-	if packetData[0] >> 4 != 4 {
+	if packetData[0]>>4 != 4 {
 		return nil
 	}
 	packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Lazy)
@@ -72,7 +72,7 @@ func srcIP(packetData []byte) net.IP {
 }
 
 func dstIP(packetData []byte) net.IP {
-	if packetData[0] >> 4 != 4 {
+	if packetData[0]>>4 != 4 {
 		return nil
 	}
 	packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Lazy)
@@ -92,7 +92,7 @@ func (t *tunnelConnection) writePacket(data []byte, server bool) error {
 	stream.XORKeyStream(encryptedPacket[16:], data)
 
 	if server {
-		_, err := udpSocket.WriteToUDP(encryptedPacket, &t.remote)
+		_, err := udpSocket.WriteTo(encryptedPacket, t.remote)
 		return err
 	} else {
 		_, err := udpSocket.Write(encryptedPacket)
@@ -120,7 +120,7 @@ func findRemote(ip net.IP) *tunnelConnection {
 	return nil
 }
 
-func findRemoteByUDP(addr net.UDPAddr) *tunnelConnection {
+func findRemoteByAddr(addr net.Addr) *tunnelConnection {
 	for i := range remotes {
 		if remotes[i].remote.String() == addr.String() {
 			return &remotes[i]
@@ -157,7 +157,7 @@ func fromInterfaceLoop(server bool) {
 func fromUDPLoop() {
 	buffer := make([]byte, 2048)
 	for {
-		length, addr, err := udpSocket.ReadFromUDP(buffer)
+		length, addr, err := udpSocket.ReadFrom(buffer)
 		if err != nil {
 			log.Fatal("Failed to read from UDP:", err)
 		}
@@ -165,7 +165,7 @@ func fromUDPLoop() {
 		packet := decodePacket(encryptedPacket)
 		// TODO: decode packet and forward to another client if needed
 		// TODO: drop packet if no known route to destination
-		remote := findRemoteByUDP(*addr)
+		remote := findRemoteByAddr(addr)
 		if remote == nil {
 			src := srcIP(packet)
 			if src == nil {
@@ -173,7 +173,7 @@ func fromUDPLoop() {
 				continue
 			}
 			log.Println("new remote, ip:", src)
-			remotes = append(remotes, newConnection(*addr, src))
+			remotes = append(remotes, newConnection(addr, src))
 		}
 		length, err = iface.Write(packet)
 		if err != nil {
@@ -229,7 +229,7 @@ func main() {
 		if err != nil {
 			log.Fatal("Failed to dial UDP outbound:", err)
 		}
-		remotes = append(remotes, tunnelConnection{*udp, anyNet})
+		remotes = append(remotes, tunnelConnection{udp, anyNet})
 	}
 
 	go fromInterfaceLoop(*server)
