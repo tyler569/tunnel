@@ -19,12 +19,6 @@ import (
 var block cipher.Block
 var udpSocket *net.UDPConn
 var iface *water.Interface
-var remotes []tunnelConnection
-
-var anyNet net.IPNet = net.IPNet{
-	net.IPv4(0, 0, 0, 0),
-	net.IPv4Mask(0, 0, 0, 0),
-}
 
 func createTunAdapter(name string, address string) *water.Interface {
 	config := water.Config{
@@ -83,7 +77,7 @@ func dstIP(packetData []byte) net.IP {
 	return ip4Layer.DstIP
 }
 
-func (t *tunnelConnection) writePacket(data []byte, server bool) error {
+func (t *remotePeer) writePacket(data []byte, server bool) error {
 	encryptedPacket := make([]byte, len(data)+16)
 	iv := randomIV()
 	copy(encryptedPacket, iv)
@@ -92,7 +86,7 @@ func (t *tunnelConnection) writePacket(data []byte, server bool) error {
 	stream.XORKeyStream(encryptedPacket[16:], data)
 
 	if server {
-		_, err := udpSocket.WriteTo(encryptedPacket, t.remote)
+		_, err := udpSocket.WriteTo(encryptedPacket, t.addr)
 		return err
 	} else {
 		_, err := udpSocket.Write(encryptedPacket)
@@ -111,24 +105,6 @@ func decodePacket(encryptedPacket []byte) []byte {
 	return data
 }
 
-func findRemote(ip net.IP) *tunnelConnection {
-	for i := range remotes {
-		if remotes[i].tunnelNet.Contains(ip) {
-			return &remotes[i]
-		}
-	}
-	return nil
-}
-
-func findRemoteByAddr(addr net.Addr) *tunnelConnection {
-	for i := range remotes {
-		if remotes[i].remote.String() == addr.String() {
-			return &remotes[i]
-		}
-	}
-	return nil
-}
-
 func fromInterfaceLoop(server bool) {
 	buffer := make([]byte, 2048)
 	for {
@@ -139,16 +115,16 @@ func fromInterfaceLoop(server bool) {
 		packet := buffer[:length]
 
 		dst := dstIP(packet)
-		remote := findRemote(dst)
-		if remote == nil {
-			log.Println("No remote found for tunnel address:", dst)
-			log.Println("remotes:", remotes)
+		peer := findPeer(dst)
+		if peer == nil {
+			log.Println("No peer found for tunnel address:", dst)
+			log.Println("peers:", peers)
 			continue
 		}
 
-		err = remote.writePacket(packet, server)
+		err = peer.writePacket(packet, server)
 		if err != nil {
-			log.Println("Failed to send packet to:", remote.remote, err)
+			log.Println("Failed to send packet to:", peer.addr, err)
 			continue
 		}
 	}
@@ -165,15 +141,15 @@ func fromUDPLoop() {
 		packet := decodePacket(encryptedPacket)
 		// TODO: decode packet and forward to another client if needed
 		// TODO: drop packet if no known route to destination
-		remote := findRemoteByAddr(addr)
-		if remote == nil {
+		peer := findPeerByAddr(addr)
+		if peer == nil {
 			src := srcIP(packet)
 			if src == nil {
 				// v6 probably
 				continue
 			}
-			log.Println("new remote, ip:", src)
-			remotes = append(remotes, newConnection(addr, src))
+			log.Println("new peer, ip:", src)
+			addPeer(addr, src)
 		}
 		length, err = iface.Write(packet)
 		if err != nil {
@@ -186,7 +162,7 @@ func main() {
 	var (
 		server = flag.Bool("server", false, "Acting as server")
 		addr   = flag.String("addr", "10.254.1.2/24", "Address of the tunnel adapter")
-		remote = flag.String("remote", "", "Address of server to connect to")
+		peer = flag.String("peer", "", "Address of server to connect to")
 		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
 		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
 	)
@@ -199,9 +175,9 @@ func main() {
 		log.Println("Starting tunnel as client with addr", *addr)
 	}
 
-	remote_s := *remote + ":" + strconv.Itoa(*port)
+	peer_s := *peer + ":" + strconv.Itoa(*port)
 
-	udp, err := net.ResolveUDPAddr("udp", remote_s)
+	udp, err := net.ResolveUDPAddr("udp", peer_s)
 	if err != nil {
 		log.Fatal("Failed to resolve address:", err)
 	}
@@ -229,7 +205,7 @@ func main() {
 		if err != nil {
 			log.Fatal("Failed to dial UDP outbound:", err)
 		}
-		remotes = append(remotes, tunnelConnection{udp, anyNet})
+		addDefaultPeer(udp)
 	}
 
 	go fromInterfaceLoop(*server)
