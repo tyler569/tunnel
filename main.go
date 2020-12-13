@@ -158,15 +158,15 @@ func fromUDPLoop() {
 	}
 }
 
-func main() {
-	var (
-		server = flag.Bool("server", false, "Acting as server")
-		addr   = flag.String("addr", "10.254.1.2/24", "Address of the tunnel adapter")
-		peer = flag.String("peer", "", "Address of server to connect to")
-		port   = flag.Int("port", 8084, "Port to use for tunnel connection")
-		psk    = flag.String("psk", "", "Pre-shard key for tunnel")
-	)
+var (
+	server = flag.Bool("server", false, "Acting as server")
+	addr   = flag.String("addr", "10.254.1.2/24", "Address of the tunnel adapter")
+	peer   = flag.String("peer", "", "Address of server to connect to")
+	port   = flag.Int("port", 8084, "Port to use for tunnel connection")
+	psk    = flag.String("psk", "", "Pre-shard key for tunnel")
+)
 
+func main() {
 	flag.Parse()
 
 	if *server {
